@@ -1,0 +1,1184 @@
+import ccxt
+import pandas as pd
+import talib
+import time
+import datetime
+import pytz
+import sys
+import requests
+import traceback
+import numpy as np
+import os
+import json
+import copy
+
+# ======================================================================
+# 1. تنظیمات کوینکس و پارامترهای اصلی (از Environment Variables استفاده می‌شود)
+# ======================================================================
+
+# 🔒🔑 امنیت: کلیدها از متغیرهای محیطی (COINEX_API_KEY, COINEX_SECRET, etc.) خوانده می‌شوند.
+API_KEY = os.getenv("COINEX_API_KEY")
+SECRET = os.getenv("COINEX_SECRET")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not all([API_KEY, SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    print("❌ خطای امنیتی: کلیدهای API یا تلگرام در Environment Variables تنظیم نشده‌اند.")
+    print("لطفاً فایل trading_bot.service را بررسی و مقادیر Environment را پر کنید.")
+    sys.exit()
+
+# تنظیمات عمومی و ریسک
+LIVE_TRADING = False                  # 💡 در حال حاضر برای تست شبیه‌سازی: FALSE
+LEVERAGE = 5.0                        # اهرم (Leverage)
+INITIAL_CAPITAL = 40.0                # سرمایه اولیه در صورت نبودن فایل وضعیت
+RISK_PER_TRADE = 0.015                # درصد ریسک در هر معامله (1.5%)
+
+# 🛡️ پارامتر محدودیت مجموع مارجین مصرفی (ثابت: 90%)
+MAX_TOTAL_MARGIN_PERCENT = 0.90
+
+# ❗ مسیر فایل وضعیت در محیط VPS
+STATE_FILE = 'bot_state.json'
+TEHRAN_TIMEZONE = pytz.timezone('Asia/Tehran')
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+# ... (بقیه تنظیمات ثابت) ...
+TIMEFRAME = '15m'
+OHLCV_LIMIT = 300
+TREND_TIMEFRAME = '4h'
+LONG_TERM_EMA_PERIOD = 20
+
+SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'ADA/USDT',
+    'XRP/USDT', 'DOGE/USDT', 'DOT/USDT', 'LINK/USDT',
+    'UNI/USDT', 'LTC/USDT',
+    'BNB/USDT', 'AVAX/USDT', 'ETC/USDT', 'ATOM/USDT'
+]
+
+CORRELATION_GROUPS = {
+    'BTC_Main': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'LTC/USDT'],
+    'SOL_Ecosystem': ['SOL/USDT', 'AVAX/USDT', 'DOT/USDT'],
+    'Alt_Value': ['ADA/USDT', 'XRP/USDT', 'DOGE/USDT', 'ETC/USDT', 'ATOM/USDT', 'LINK/USDT', 'UNI/USDT']
+}
+MAX_GROUP_TRADES = 2
+
+MARKET_DATA = {}
+LONG_TERM_TRENDS = {}
+MAX_CONCURRENT_TRADES = 7
+
+# ... (اتصال به صرافی ثابت) ...
+try:
+    exchange = ccxt.coinex({
+        'apiKey': API_KEY,
+        'secret': SECRET,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'future'}
+    })
+
+except Exception as e:
+    print(f"خطا در اتصال به صرافی: {e}")
+    sys.exit()
+
+# ======================================================================
+# 2. پارامترهای استراتژی‌ها و فیلترهای نوسان
+# ======================================================================
+ATR_PERIOD = 14
+RSI_PERIOD = 14
+VOLUME_AVG_PERIOD = 50
+MIN_VOLUME_MULTIPLIER = 1.2
+EMA_TREND_PERIOD = 50
+
+MIN_SL_PERCENT = 0.003
+SPIKE_BODY_MULTIPLIER = 3.0
+SPT_MIN_BODY_CHECK = True
+SPT_RR_RATIO = 2.0
+RSI_ADAPT_PERIOD = 200
+RSI_ADAPT_LOWER_PERCENTILE = 0.10
+RSI_ADAPT_UPPER_PERCENTILE = 0.90
+SMART_ENTRY_ENABLED = True
+SMART_ENTRY_RETRA_RATIO = 0.5
+SMART_ENTRY_EXPIRY_CANDLES = 1
+MAX_DAILY_LOSS_PERCENT = 0.05
+MAX_LOSS_PER_SYMBOL_PERCENT = 0.03
+
+ADX_PERIOD = 14
+ADX_MIN_LEVEL = 25.0
+
+TRAILING_ATR_MULTIPLIER = 1.5
+TRAILING_BE_R_ACTIVATION = 1.0
+TRAILING_R_ACTIVATION = 1.5
+
+# متغیرهای سراسری برای نگهداری وضعیت
+CAPITAL = INITIAL_CAPITAL
+RISK_AMOUNT = 0
+MAX_TOTAL_MARGIN = 0
+DAILY_LOSS_LIMIT = 0
+
+Strategy_Stats_Template = {
+    'TrendBreakout': {'Win': 0, 'Loss': 0, 'PnL': 0.0},
+    'SPT': {'Win': 0, 'Loss': 0, 'PnL': 0.0}
+}
+Strategy_Stats = copy.deepcopy(Strategy_Stats_Template)
+
+Ledger = {}
+Daily_Stats = {'Total PnL': 0, 'Wins': 0, 'Losses': 0, 'WinRate': 0}
+Symbol_Losses = {symbol: 0 for symbol in SYMBOLS}
+Trade_Counter = 0
+last_candle_timestamp = {}
+current_candle = {'close': 0}
+LAST_REPORT_DATE = None
+
+# ======================================================================
+# 3. توابع Utility, Persistence, و مدیریت سفارشات
+# ======================================================================
+
+# --- توابع Utility و Persistence ---
+def get_tehran_time(timestamp_ms=None):
+    if timestamp_ms is None:
+        dt = datetime.datetime.now(TEHRAN_TIMEZONE)
+    else:
+        dt = datetime.datetime.fromtimestamp(timestamp_ms / 1000.0, TEHRAN_TIMEZONE)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
+    try:
+        requests.post(TELEGRAM_API_URL, data=payload, timeout=15)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ خطا در ارسال پیام تلگرام: {e}")
+
+def get_real_capital_from_exchange():
+    global exchange, CAPITAL
+    if not LIVE_TRADING:
+        return CAPITAL
+
+    try:
+        balance = exchange.fetch_balance({'type': 'future'})
+        if 'USDT' in balance and 'total' in balance['USDT']:
+             real_capital = balance['USDT']['total']
+             return max(0.0, real_capital)
+        return 0.0
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ❌ خطا در دریافت موجودی واقعی از صرافی: {e}")
+        return 0.0
+
+def save_state():
+    global Ledger, Daily_Stats, Symbol_Losses, Trade_Counter, Strategy_Stats, LAST_REPORT_DATE, CAPITAL
+
+    def to_float(value):
+        if isinstance(value, (np.float64, np.float32)):
+            return float(value)
+        return value
+
+    serializable_ledger = {}
+    for sym, trade in Ledger.items():
+        serializable_trade = {k: to_float(v) for k, v in trade.items()}
+        if 'trades' in serializable_trade:
+             serializable_trade['trades'] = [
+                 {k: to_float(v) for k, v in t.items()}
+                 for t in serializable_trade['trades']
+             ]
+        serializable_ledger[sym] = serializable_trade
+
+    serializable_strategy_stats = {
+        k: {sk: to_float(sv) for sk, sv in v.items()}
+        for k, v in Strategy_Stats.items()
+    }
+
+    data = {
+        'CAPITAL': CAPITAL,
+        'Ledger': serializable_ledger,
+        'Daily_Stats': Daily_Stats,
+        'Symbol_Losses': Symbol_Losses,
+        'Trade_Counter': Trade_Counter,
+        'Strategy_Stats': serializable_strategy_stats,
+        'LAST_REPORT_DATE': LAST_REPORT_DATE,
+        'Last_Save_Time': get_tehran_time()
+    }
+
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ❌❌❌ خطای بحرانی: ذخیره وضعیت ربات شکست خورد! (دلیل: {e})")
+
+def recalculate_risk_parameters():
+    global RISK_AMOUNT, MAX_TOTAL_MARGIN, DAILY_LOSS_LIMIT, CAPITAL
+
+    if CAPITAL <= 0:
+        CAPITAL = INITIAL_CAPITAL
+
+    RISK_AMOUNT = CAPITAL * RISK_PER_TRADE
+    MAX_TOTAL_MARGIN = CAPITAL * MAX_TOTAL_MARGIN_PERCENT
+    DAILY_LOSS_LIMIT = CAPITAL * MAX_DAILY_LOSS_PERCENT
+
+    print(f"[{get_tehran_time()}] 🔄 پارامترهای ریسک به‌روز شد. ریسک دلاری: ${round(RISK_AMOUNT, 2)}. سقف مارجین: ${round(MAX_TOTAL_MARGIN, 2)}")
+
+def load_state():
+    global Ledger, Daily_Stats, Symbol_Losses, Trade_Counter, Strategy_Stats, LAST_REPORT_DATE, CAPITAL
+
+    CAPITAL = INITIAL_CAPITAL
+
+    if not os.path.exists(STATE_FILE):
+        print(f"[{get_tehran_time()}] 💡 فایل وضعیت ({STATE_FILE}) یافت نشد. با داده‌های پیش‌فرض شروع می‌شود.")
+        recalculate_risk_parameters()
+        return
+
+    try:
+        with open(STATE_FILE, 'r') as f:
+            data = json.load(f)
+
+            CAPITAL = data.get('CAPITAL', INITIAL_CAPITAL)
+
+            Ledger = data.get('Ledger', {})
+            Daily_Stats = data.get('Daily_Stats', {'Total PnL': 0, 'Wins': 0, 'Losses': 0, 'WinRate': 0})
+            Symbol_Losses = data.get('Symbol_Losses', {symbol: 0 for symbol in SYMBOLS})
+            Trade_Counter = data.get('Trade_Counter', 0)
+
+            loaded_stats = data.get('Strategy_Stats', Strategy_Stats_Template)
+            for strategy, stats in loaded_stats.items():
+                if strategy in Strategy_Stats:
+                    Strategy_Stats[strategy] = stats
+
+            LAST_REPORT_DATE = data.get('LAST_REPORT_DATE', None)
+
+            Ledger = {sym: trade for sym, trade in Ledger.items() if trade['status'] in ['OPEN', 'PENDING']}
+
+            real_balance = get_real_capital_from_exchange()
+            if LIVE_TRADING and real_balance > 0 and abs(CAPITAL - real_balance) > 1.0:
+                capital_change = real_balance - CAPITAL
+                if capital_change > 0: change_reason = "واریز دستی"
+                else: change_reason = "برداشت دستی"
+
+                print(f"[{get_tehran_time()}] ⚠️ CAPITAL داخلی ({round(CAPITAL, 2)}$) با موجودی واقعی صرافی ({round(real_balance, 2)}$) مغایرت دارد. تنظیم شد. دلیل: {change_reason}")
+                CAPITAL = real_balance
+
+            recalculate_risk_parameters()
+
+            print(f"[{get_tehran_time()}] ✅ وضعیت ربات از فایل بازیابی شد. سرمایه فعلی: ${round(CAPITAL, 2)}")
+
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ⚠️ خطا در بارگذاری وضعیت: {e}. با داده‌های پیش‌فرض ادامه می‌دهد.")
+        recalculate_risk_parameters()
+
+
+def update_capital_after_trade(pnl):
+    """به‌روزرسانی CAPITAL پس از بسته شدن معامله."""
+    global CAPITAL
+    CAPITAL += pnl
+    recalculate_risk_parameters()
+    print(f"[{get_tehran_time()}] 📈 سرمایه کل به‌روز شد: ${round(CAPITAL, 2)} (+/- ${round(pnl, 2)})")
+
+# --- توابع Core Logic و Risk Management ---
+
+def load_market_params():
+    """دریافت و ذخیره اطلاعات ضروری بازار از صرافی."""
+    global MARKET_DATA
+    current_time = get_tehran_time()
+    print(f"[{current_time}] 🌐 در حال دریافت پارامترهای بازار...")
+
+    try:
+        markets = exchange.load_markets()
+        SYMBOLS_TEMP = SYMBOLS.copy()
+        SYMBOLS.clear()
+        for symbol in SYMBOLS_TEMP:
+            if symbol not in markets:
+                print(f"[{current_time}] ❌ نماد {symbol} در صرافی یافت نشد. حذف شد.")
+                continue
+            SYMBOLS.append(symbol)
+            market = markets[symbol]
+            base_currency = market['base']
+            quote_currency = market['quote']
+
+            # دقت اعشار (Precision) و حداقل/حداکثر مقادیر
+            precision_amount = market['precision']['amount']
+            precision_price = market['precision']['price']
+            min_amount = market['limits']['amount']['min']
+            min_usd = market['limits']['cost']['min'] if 'cost' in market['limits'] else 10.0
+
+            MARKET_DATA[symbol] = {
+                'base': base_currency,
+                'quote': quote_currency,
+                'precision_amount': precision_amount,
+                'precision_price': precision_price,
+                'min_amount': min_amount,
+                'min_usd': min_usd
+            }
+        print(f"[{current_time}] ✅ پارامترهای {len(SYMBOLS)} نماد با موفقیت بارگذاری شد.")
+        return True
+    except Exception as e:
+        print(f"[{current_time}] ❌ خطای بحرانی در بارگذاری پارامترهای بازار: {e}")
+        return False
+
+def calculate_position_size(symbol, entry_price, sl_price, risk_amount_usd):
+    """محاسبه سایز پوزیشن بر اساس فاصله SL و مدیریت ریسک."""
+
+    market_info = MARKET_DATA.get(symbol)
+    if not market_info:
+        return 0.0
+
+    sl_distance_percent = abs(entry_price - sl_price) / entry_price
+
+    # اطمینان از اینکه SL فاصله منطقی دارد
+    if sl_distance_percent < MIN_SL_PERCENT:
+        print(f"[{get_tehran_time()}] ⚠️ SL برای {symbol} خیلی کوچک است ({sl_distance_percent*100:.2f}%).")
+        return 0.0
+
+    # 1. محاسبه مقدار دلاری (Position Value)
+    position_value_usd = risk_amount_usd / sl_distance_percent
+
+    # 2. محاسبه مارجین مورد نیاز
+    margin_needed = position_value_usd / LEVERAGE
+
+    # 3. چک کردن محدودیت کل مارجین
+    current_total_margin = sum(trade['margin'] for trade in Ledger.values() if trade['status'] in ['OPEN', 'PENDING'] and trade.get('strategy') != 'UNMANAGED')
+
+    if (current_total_margin + margin_needed) > MAX_TOTAL_MARGIN:
+        return 0.0
+
+    # 4. محاسبه سایز (Size) بر اساس مقدار دلاری و قیمت ورود
+    size = position_value_usd / entry_price
+
+    # 5. اعمال دقت اعشار صرافی
+    precision = market_info['precision_amount']
+    size = round(size, precision)
+
+    # 6. چک کردن حداقل سایز (Min Amount)
+    min_amount = market_info['min_amount']
+    min_usd_req = market_info['min_usd']
+
+    if size < min_amount or (size * entry_price) < min_usd_req:
+        return 0.0
+
+    return size
+
+def check_correlation_filter(symbol, side):
+    """چک می‌کند آیا تعداد معاملات باز در گروه همبستگی به سقف خود رسیده است."""
+    group_name = None
+    for group, symbols_in_group in CORRELATION_GROUPS.items():
+        if symbol in symbols_in_group:
+            group_name = group
+            break
+
+    if not group_name:
+        return True, "بدون گروه همبستگی"
+
+    open_trades_in_group = sum(
+        1 for sym, trade in Ledger.items()
+        if trade['status'] in ['OPEN', 'PENDING'] and sym in CORRELATION_GROUPS[group_name]
+    )
+
+    if open_trades_in_group >= MAX_GROUP_TRADES:
+        return False, f"سقف معاملات گروه {group_name} فعال شد ({MAX_GROUP_TRADES}/{open_trades_in_group+1})"
+
+    return True, "تایید شد"
+
+def get_strategy_performance_report():
+    """تولید گزارش عملکرد روزانه و کلی."""
+    global Daily_Stats, Strategy_Stats, CAPITAL, INITIAL_CAPITAL
+
+    report = "**📊 گزارش عملکرد روزانه ربات (پایان روز)**\n\n"
+    report += f"🗓️ تاریخ: {get_tehran_time().split(' ')[0]}\n"
+    report += f"💰 سود/زیان روز: **${round(Daily_Stats['Total PnL'], 2)}**\n"
+    report += f"🏆 معاملات برد: {Daily_Stats['Wins']} | 📉 معاملات باخت: {Daily_Stats['Losses']}\n"
+    total_daily_trades = Daily_Stats['Wins'] + Daily_Stats['Losses']
+    daily_win_rate = (Daily_Stats['Wins'] / total_daily_trades) * 100 if total_daily_trades > 0 else 0
+    report += f"🎯 درصد برد: **{round(daily_win_rate, 2)}%**\n"
+
+    report += "\n**📈 عملکرد استراتژی‌ها (روزانه):**\n"
+    for strategy, stats in Strategy_Stats.items():
+        if stats['Win'] + stats['Loss'] > 0:
+            report += f"- {strategy}: PnL=${round(stats['PnL'], 2)} (برد/باخت: {stats['Win']}/{stats['Loss']})\n"
+
+    report += "\n**🏦 وضعیت کلی سرمایه:**\n"
+    overall_pnl = CAPITAL - INITIAL_CAPITAL
+    report += f"💵 سرمایه اولیه: ${round(INITIAL_CAPITAL, 2)}\n"
+    report += f"💵 سرمایه فعلی: **${round(CAPITAL, 2)}**\n"
+    report += f"📈 سود/زیان کلی: **${round(overall_pnl, 2)}**\n"
+
+    return report
+
+def reset_daily_stats():
+    """بازنشانی آمار روزانه برای شروع روز جدید."""
+    global Daily_Stats, Symbol_Losses, Strategy_Stats, LAST_REPORT_DATE
+
+    Daily_Stats = {'Total PnL': 0, 'Wins': 0, 'Losses': 0, 'WinRate': 0}
+    Symbol_Losses = {symbol: 0 for symbol in SYMBOLS}
+    Strategy_Stats = copy.deepcopy(Strategy_Stats_Template)
+    LAST_REPORT_DATE = get_tehran_time().split(' ')[0]
+
+    print(f"[{get_tehran_time()}] 🔄 آمار روزانه بازنشانی شد.")
+
+def check_max_daily_loss():
+    """بررسی می‌کند که آیا سقف زیان روزانه رسیده است یا خیر."""
+    global CAPITAL, DAILY_LOSS_LIMIT, exchange, SYMBOLS, Symbol_Losses, MAX_LOSS_PER_SYMBOL_PERCENT
+
+    current_loss = 0
+    if Daily_Stats['Total PnL'] < 0:
+        current_loss = abs(Daily_Stats['Total PnL'])
+
+    if current_loss >= DAILY_LOSS_LIMIT:
+
+        telegram_msg = (
+            f"**❌🚨 سقف زیان روزانه فعال شد!**\n"
+            f"محدودیت زیان: **${round(DAILY_LOSS_LIMIT, 2)}**\n"
+            f"زیان امروز: **${round(current_loss, 2)}**\n"
+            f"❌ ربات تا فردا صبح (پس از بازنشانی آمار) از ورود به معاملات جدید خودداری می‌کند."
+        )
+
+        # بستن تمام معاملات باز برای محافظت از سرمایه
+        closed_count = 0
+        for symbol, trade in list(Ledger.items()):
+             if trade['status'] == 'OPEN' and trade.get('strategy') != 'UNMANAGED':
+                # بستن با مارکت
+                try:
+                    if LIVE_TRADING:
+                        close_side = 'sell' if trade['side'] == 'LONG' else 'buy'
+                        exchange.create_order(symbol, 'market', close_side, trade['size'])
+                        cancel_all_native_orders(symbol)
+
+                    # 💡 در حالت شبیه‌سازی، پوزیشن را با قیمت فعلی می‌بندیم.
+                    else:
+                         current_price = exchange.fetch_ticker(symbol)['last']
+                         update_ledger_simulated(symbol, trade['side'], trade['size'], trade['entry'], trade['sl'], trade['tp'], 'CLOSED', trade['strategy'], trade['id'], time_exit=current_price)
+
+                    Ledger.pop(symbol)
+                    closed_count += 1
+                except Exception as e:
+                    print(f"[{get_tehran_time()}] ❌ خطا در بستن اضطراری {symbol}: {e}")
+
+        if closed_count > 0:
+            telegram_msg += f"\n**🛑 {closed_count} پوزیشن اضطراری بسته شد.**"
+
+        send_telegram_message(telegram_msg)
+        print(f"[{get_tehran_time()}] 🚨 سقف زیان روزانه فعال شد.")
+
+        # غیرفعال کردن نمادهایی که به سقف زیان ماهانه/هفتگی رسیده‌اند
+        SYMBOLS_TEMP = SYMBOLS.copy()
+
+        def filter_symbols(sym):
+            # این فیلتر نمادهایی را که از سقف زیان ماهانه/هفتگی فراتر رفته‌اند حذف می‌کند
+            # (MAX_LOSS_PER_SYMBOL_PERCENT = 3% از کل سرمایه)
+            if sym in Symbol_Losses and Symbol_Losses[sym] >= CAPITAL * MAX_LOSS_PER_SYMBOL_PERCENT:
+                return False
+            return True
+
+        SYMBOLS = list(filter(filter_symbols, SYMBOLS_TEMP))
+
+        if len(SYMBOLS) < len(SYMBOLS_TEMP):
+             print(f"[{get_tehran_time()}] 🛡️ {len(SYMBOLS_TEMP) - len(SYMBOLS)} نماد به دلیل سقف زیان هفتگی/ماهانه غیرفعال شدند.")
+
+        save_state()
+        sys.exit() # 🛑 توقف موقت ربات (یا ادامه کار بدون ورود جدید)
+
+
+# --- توابع مدیریت سفارشات بومی (فقط در Live Trading استفاده می‌شود) ---
+
+def cancel_all_native_orders(symbol):
+    """لغو تمام سفارشات فعال TP و SL در صرافی برای یک نماد (فقط Live Trading)."""
+    global exchange, Ledger
+    if not LIVE_TRADING or symbol not in Ledger: return
+
+    try:
+        open_orders = exchange.fetch_open_orders(symbol)
+
+        tp_id = Ledger[symbol].get('tp_order_id')
+        sl_id = Ledger[symbol].get('sl_order_id')
+
+        cancelled_count = 0
+
+        if sl_id:
+            try:
+                exchange.cancel_order(sl_id, symbol)
+                Ledger[symbol].pop('sl_order_id', None)
+                cancelled_count += 1
+            except ccxt.OrderNotFound: Ledger[symbol].pop('sl_order_id', None)
+
+        if tp_id:
+            try:
+                exchange.cancel_order(tp_id, symbol)
+                Ledger[symbol].pop('tp_order_id', None)
+                cancelled_count += 1
+            except ccxt.OrderNotFound: Ledger[symbol].pop('tp_order_id', None)
+
+        if cancelled_count > 0:
+            print(f"[{get_tehran_time()}] 🚫 {cancelled_count} سفارش TP/SL بومی برای {symbol} لغو شد.")
+            save_state()
+
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ❌ خطا در لغو سفارشات بومی {symbol}: {e}")
+
+
+def place_order_and_set_native_stop(symbol, side, size, sl, tp):
+    """ثبت پوزیشن اصلی و سپس ثبت سفارشات SL و TP در صرافی (فقط Live Trading)."""
+    global exchange
+    if not LIVE_TRADING:
+        return True, exchange.fetch_ticker(symbol)['last'], None, None
+
+    close_side = 'sell' if side == 'LONG' else 'buy'
+    open_side = 'buy' if side == 'LONG' else 'sell'
+    market_info = MARKET_DATA.get(symbol, {})
+    size = round(size, market_info.get('precision_amount', 4))
+
+    try:
+        # 1. اجرای معامله Market
+        open_order = exchange.create_order(symbol, 'market', open_side, size, None, {'leverage': LEVERAGE})
+        entry_price = open_order['price'] if open_order['price'] else exchange.fetch_ticker(symbol)['last']
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ❌ خطا در باز کردن پوزیشن {symbol}: {e}")
+        return False, 0.0, None, None
+
+    sl_id, tp_id = None, None
+
+    # 2. ثبت سفارش SL (Stop-Loss)
+    try:
+        # در Coinex از نوع Limit با StopPrice استفاده می‌کنیم
+        sl_order = exchange.create_order(symbol, 'limit', close_side, size, sl, {'stopLossPrice': sl})
+        sl_id = sl_order['id']
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ❌ خطا در ثبت سفارش SL برای {symbol}: {e}. پوزیشن باز است!")
+
+    # 3. ثبت سفارش TP (Take-Profit)
+    try:
+        tp_order = exchange.create_order(symbol, 'limit', close_side, size, tp, {'takeProfitPrice': tp})
+        tp_id = tp_order['id']
+    except Exception as e:
+        print(f"[{get_tehran_time()}] ❌ خطا در ثبت سفارش TP برای {symbol}: {e}. پوزیشن باز است!")
+
+    return True, entry_price, sl_id, tp_id
+
+
+def update_ledger_from_exchange_close(symbol, side, size, entry, exit_price, pnl, strategy, trade_id):
+    """به‌روزرسانی Ledger با اطلاعات بسته شدن از صرافی (فقط Live Trading)."""
+    global Daily_Stats, Symbol_Losses, Strategy_Stats, Ledger
+    current_time = get_tehran_time()
+
+    exit_reason = "توسط صرافی/نامشخص"
+    if pnl > 0:
+        exit_reason = "بسته شدن سودده (TP/SL متحرک توسط صرافی)"
+    elif pnl < 0:
+        exit_reason = "SL (حد ضرر توسط صرافی)"
+
+    update_capital_after_trade(pnl)
+
+    Daily_Stats['Total PnL'] += pnl
+    if pnl > 0: Daily_Stats['Wins'] += 1
+    else:
+        Daily_Stats['Losses'] += 1
+        Symbol_Losses[symbol] += abs(pnl)
+
+    total_trades = Daily_Stats['Wins'] + Daily_Stats['Losses']
+    Daily_Stats['WinRate'] = (Daily_Stats['Wins'] / total_trades) * 100 if total_trades > 0 else 0
+
+    if strategy in Strategy_Stats:
+        Strategy_Stats[strategy]['PnL'] += pnl
+        if pnl > 0: Strategy_Stats[strategy]['Win'] += 1
+        else: Strategy_Stats[strategy]['Loss'] += 1
+
+    telegram_msg = (
+        f"**🚀🛑 معامله توسط صرافی بسته شد** (ID: {trade_id})\n"
+        f"📈 نماد: {symbol} ({side})\n"
+        f"🔬 استراتژی: **{strategy}**\n"
+        f"🗓️ زمان خروج: {current_time}\n"
+        f"🚪 قیمت خروج (تخمین): {round(exit_price, 4)}\n"
+        f"📊 نتیجه: **{('✅ WIN' if pnl > 0 else '❌ LOSS')}** ({exit_reason})\n"
+        f"💰 سود/زیان نهایی: **${round(pnl, 2)}**"
+    )
+    send_telegram_message(telegram_msg)
+    save_state()
+
+def sync_with_exchange():
+    """همگام‌سازی Ledger داخلی ربات با پوزیشن‌های باز واقعی در صرافی."""
+    global Ledger
+    current_time = get_tehran_time()
+
+    if not LIVE_TRADING:
+        return
+
+    try:
+        # 1. دریافت پوزیشن‌های واقعی باز از صرافی
+        positions = exchange.fetch_positions(SYMBOLS)
+        real_open_symbols = {}
+        for pos in positions:
+            symbol = pos['symbol']
+            contracts = float(pos.get('contracts', 0))
+            if abs(contracts) > 0:
+                side = 'LONG' if contracts > 0 else 'SHORT'
+                real_open_symbols[symbol] = {
+                   'entry_price': float(pos['entryPrice']),
+                   'side': side,
+                   'size': abs(contracts),
+                   'pnl': float(pos['unrealizedPnl']),
+                }
+
+        symbols_to_delete = []
+        for symbol, trade in list(Ledger.items()):
+
+            # 2. بررسی معاملات OPEN در Ledger که در صرافی بسته شده‌اند
+            if trade['status'] == 'OPEN' and abs(trade['size']) > 0:
+                is_open_in_exchange = False
+                for pos in positions:
+                     if pos['symbol'] == symbol and abs(float(pos.get('contracts', 0))) == trade['size']:
+                        is_open_in_exchange = True
+                        break
+
+                if not is_open_in_exchange:
+                    print(f"[{current_time}] 🚀 پوزیشن {symbol} (ID:{trade.get('id')}) توسط صرافی بسته شد. به‌روزرسانی Ledger.")
+                    try:
+                        # تلاش برای یافتن اطلاعات PnL از آخرین ترید بسته شده
+                        closed_trade_info = exchange.fetch_my_trades(symbol, limit=1)
+                        if closed_trade_info and closed_trade_info[0]['info'].get('deal_profit_pnl'):
+                            exit_price = closed_trade_info[0]['price']
+                            pnl = float(closed_trade_info[0]['info']['deal_profit_pnl'])
+                            update_ledger_from_exchange_close(symbol, trade['side'], trade['size'], trade['entry'], exit_price, pnl, trade['strategy'], trade['id'])
+                            symbols_to_delete.append(symbol)
+                            cancel_all_native_orders(symbol)
+                        else:
+                            # اگر اطلاعات PnL قابل استخراج نبود، فرض بر بسته شدن نامشخص (Unmanaged)
+                            print(f"[{current_time}] ⚠️ جزئیات PnL برای {symbol} یافت نشد. پوزیشن از Ledger حذف شد.")
+                            symbols_to_delete.append(symbol)
+
+                    except Exception as e:
+                         print(f"[{current_time}] ❌ خطا در دریافت جزئیات معامله بسته شده {symbol}: {e}")
+                         symbols_to_delete.append(symbol)
+
+        for symbol in symbols_to_delete:
+            Ledger.pop(symbol, None)
+
+        # 3. افزودن پوزیشن‌های باز در صرافی که در Ledger نیستند (Unmanaged)
+        added_unmanaged_count = 0
+        for symbol, pos_data in real_open_symbols.items():
+            if symbol not in Ledger or Ledger[symbol]['status'] in ['CLOSED', 'PENDING']:
+                Ledger[symbol] = {
+                    'status': 'OPEN', 'side': pos_data['side'], 'size': pos_data['size'],
+                    'entry': pos_data['entry_price'],
+                    'sl': 0, 'tp': 0,
+                    'initial_sl': 0, 'time_entry': current_time,
+                    'strategy': 'UNMANAGED', 'id': 'UNMANAGED',
+                    'margin': (pos_data['size'] * pos_data['entry_price']) / LEVERAGE,
+                    'trades': []
+                }
+                added_unmanaged_count += 1
+                send_telegram_message(f"**🟠 پوزیشن Unmanaged یافت شد**\n نماد: {symbol} ({pos_data['side']})")
+
+        if added_unmanaged_count > 0 or symbols_to_delete:
+            save_state()
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"[{current_time}] ❌ خطای بحرانی همگام‌سازی با صرافی: {e}")
+        send_telegram_message(f"**❌ خطای بحرانی همگام‌سازی**:\n ربات نتوانست وضعیت واقعی پوزیشن‌ها را از صرافی بگیرد. جزئیات: {error_details[:500]}...")
+
+
+# --- توابع مدیریت ریسک (شبیه‌سازی) ---
+
+def update_ledger_simulated(symbol, side, size, entry, sl, tp, status, strategy_type=None, trade_id=None, time_exit=None, sl_order_id=None, tp_order_id=None):
+    """به‌روزرسانی دفتر کل معاملات (Ledger) در حالت شبیه‌سازی/Live."""
+    global Ledger, Daily_Stats, Symbol_Losses, Strategy_Stats
+    current_time = get_tehran_time()
+
+    if status == 'OPEN':
+        global Trade_Counter
+        Trade_Counter += 1
+
+        margin_needed = round((size * entry) / LEVERAGE, 2)
+
+        Ledger[symbol] = {
+            'status': 'OPEN', 'side': side, 'size': size, 'entry': entry, 'sl': sl, 'tp': tp,
+            'initial_sl': sl,
+            'time_entry': current_time, 'strategy': strategy_type, 'id': Trade_Counter,
+            'margin': margin_needed, 'trades': [],
+            'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id
+        }
+
+        print(f"[{current_time}] 🟢 معامله {Trade_Counter} ({strategy_type} - {side}) در {symbol} با قیمت {round(entry, 4)} باز شد. SL: {round(sl, 4)} | TP: {round(tp, 4)}")
+
+        telegram_msg = (
+            f"**✅ پوزیشن جدید باز شد** (ID: **{Trade_Counter}**)\n"
+            f"📈 نماد: {symbol} ({TIMEFRAME} - **{strategy_type}**)\n"
+            f"⬆️/⬇️ نوع: **{side}** ({'Live' if LIVE_TRADING else 'شبیه‌سازی'})\n"
+            f"💰 حجم (سایز): {round(size, 4)}\n"
+            f"💵 قیمت ورود: {round(entry, 4)}\n"
+            f"🛑 SL: {round(sl, 4)} | 🎯 TP: {round(tp, 4)}"
+        )
+        send_telegram_message(telegram_msg)
+        save_state()
+
+    elif status == 'CLOSED':
+        trade = Ledger.pop(symbol, None)
+        if trade is None or trade.get('status') == 'CLOSED': return
+
+        exit_price = time_exit
+        strategy = trade.get('strategy', 'Unknown')
+        trade_id_sim = trade.get('id', 'N/A')
+
+        pnl = 0
+        if trade['side'] == 'LONG': pnl = (exit_price - trade['entry']) * trade['size']
+        elif trade['side'] == 'SHORT': pnl = (trade['entry'] - exit_price) * trade['size']
+
+        # منطق شفاف‌سازی دلیل خروج (شبیه‌سازی)
+        exit_reason = ""
+        TOLERANCE = 0.0001
+
+        if pnl < 0:
+            exit_reason = "SL (حد ضرر)"
+        elif pnl > 0:
+            is_tp_hit = abs(exit_price - trade['tp']) < TOLERANCE
+            is_trailing_sl_hit = abs(exit_price - trade['sl']) < TOLERANCE
+
+            if is_tp_hit:
+                exit_reason = "TP (حد سود)"
+            elif is_trailing_sl_hit or abs(exit_price - trade['initial_sl']) < TOLERANCE:
+                exit_reason = "SL متحرک (Trailing Stop/BE)"
+            else:
+                exit_reason = "بسته شدن مارکت (سودده/دستی)"
+        else:
+            exit_reason = "خروج سر به سر (Breakeven)"
+        # ---------------------------------------------
+
+
+        update_capital_after_trade(pnl)
+
+        Daily_Stats['Total PnL'] += pnl
+        if pnl > 0: Daily_Stats['Wins'] += 1
+        else:
+            Daily_Stats['Losses'] += 1
+            Symbol_Losses[symbol] += abs(pnl)
+
+        total_trades = Daily_Stats['Wins'] + Daily_Stats['Losses']
+        Daily_Stats['WinRate'] = (Daily_Stats['Wins'] / total_trades) * 100 if total_trades > 0 else 0
+
+        if strategy in Strategy_Stats:
+            Strategy_Stats[strategy]['PnL'] += pnl
+            if pnl > 0: Strategy_Stats[strategy]['Win'] += 1
+            else: Strategy_Stats[strategy]['Loss'] += 1
+
+        telegram_msg = (
+            f"**🛑 معامله بسته شد** (ID: **{trade_id_sim}**)\n"
+            f"📈 نماد: {symbol} ({trade['side']})\n"
+            f"🔬 استراتژی: **{strategy}**\n"
+            f"🗓️ زمان خروج: {current_time}\n"
+            f"🚪 قیمت خروج: {round(exit_price, 4)}\n"
+            f"📊 نتیجه: **{('✅ WIN' if pnl > 0 else '❌ LOSS')}** ({exit_reason})\n"
+            f"💰 سود/زیان: **${round(pnl, 2)}**"
+        )
+        send_telegram_message(telegram_msg)
+        save_state()
+
+def check_trade_status(symbol, current_high, current_low):
+    """بررسی فعال شدن SL/TP معاملات باز (فقط در شبیه‌سازی)."""
+    trade = Ledger[symbol]
+
+    if trade.get('strategy') == 'UNMANAGED': return
+
+    # Check TP
+    if trade['side'] == 'LONG' and current_high >= trade['tp']:
+        update_ledger_simulated(symbol, trade['side'], trade['size'], trade['entry'], trade['sl'], trade['tp'], 'CLOSED', trade['strategy'], trade['id'], time_exit=trade['tp'])
+        return
+    if trade['side'] == 'SHORT' and current_low <= trade['tp']:
+        update_ledger_simulated(symbol, trade['side'], trade['size'], trade['entry'], trade['sl'], trade['tp'], 'CLOSED', trade['strategy'], trade['id'], time_exit=trade['tp'])
+        return
+
+    # Check SL
+    if trade['side'] == 'LONG' and current_low <= trade['sl']:
+        update_ledger_simulated(symbol, trade['side'], trade['size'], trade['entry'], trade['sl'], trade['tp'], 'CLOSED', trade['strategy'], trade['id'], time_exit=trade['sl'])
+        return
+    if trade['side'] == 'SHORT' and current_high >= trade['sl']:
+        update_ledger_simulated(symbol, trade['side'], trade['size'], trade['entry'], trade['sl'], trade['tp'], 'CLOSED', trade['strategy'], trade['id'], time_exit=trade['sl'])
+        return
+
+
+def manage_trailing_stop(symbol, current_price, current_atr, side):
+    """مدیریت حد ضرر متحرک (Trailing Stop) (با منطق داخلی در شبیه‌سازی)."""
+    global TRAILING_ATR_MULTIPLIER, TRAILING_R_ACTIVATION, TRAILING_BE_R_ACTIVATION
+    global Ledger
+
+    trade = Ledger[symbol]
+
+    if trade.get('strategy') == 'UNMANAGED': return
+
+    initial_sl = trade['initial_sl']
+    current_sl = trade['sl']
+    entry_price = trade['entry']
+
+    risk_distance = abs(entry_price - initial_sl)
+
+    profit_to_activate_be = TRAILING_BE_R_ACTIVATION * risk_distance
+    profit_to_activate_trail = TRAILING_R_ACTIVATION * risk_distance
+    trailing_distance = TRAILING_ATR_MULTIPLIER * current_atr # ضریب 1.5
+
+    new_sl = current_sl
+
+    if side == 'LONG':
+        current_profit = current_price - entry_price
+        if current_profit >= profit_to_activate_be and current_sl < entry_price:
+            new_sl = entry_price
+        if current_profit >= profit_to_activate_trail:
+            calculated_sl = current_price - trailing_distance
+            if calculated_sl > current_sl:
+                new_sl = calculated_sl
+
+    elif side == 'SHORT':
+        current_profit = entry_price - current_price
+        if current_profit >= profit_to_activate_be and current_sl > entry_price:
+            new_sl = entry_price
+        if current_profit >= profit_to_activate_trail:
+            calculated_sl = current_price + trailing_distance
+            if calculated_sl < current_sl:
+                new_sl = calculated_sl
+
+    # اعمال تغییرات و به‌روزرسانی در Ledger (فقط اگر تغییر کرده باشد)
+    if new_sl != current_sl:
+        precision = MARKET_DATA.get(symbol, {}).get('precision_price', 4)
+        trade['sl'] = round(new_sl, precision)
+        
+        # 💡 به‌روزرسانی SL بومی در صرافی (فقط Live Trading)
+        if LIVE_TRADING and trade.get('sl_order_id'):
+            try:
+                # 1. لغو SL قدیمی
+                cancel_all_native_orders(symbol) # برای اطمینان از حذف SL و TP قبلی
+                
+                # 2. ثبت SL جدید
+                close_side = 'sell' if side == 'LONG' else 'buy'
+                size = trade['size']
+                
+                # فرض می‌کنیم TP هنوز در Ledger هست و آن را دوباره ثبت می‌کنیم
+                tp = trade['tp'] 
+                
+                sl_order = exchange.create_order(symbol, 'limit', close_side, size, trade['sl'], {'stopLossPrice': trade['sl']})
+                tp_order = exchange.create_order(symbol, 'limit', close_side, size, tp, {'takeProfitPrice': tp})
+                
+                trade['sl_order_id'] = sl_order['id']
+                trade['tp_order_id'] = tp_order['id'] # به‌روزرسانی مجدد TP ID
+                
+                print(f"[{get_tehran_time()}] 🔄 SL متحرک {symbol} به {round(new_sl, precision)} به‌روز شد.")
+                save_state()
+            except Exception as e:
+                print(f"[{get_tehran_time()}] ❌ خطا در به‌روزرسانی SL بومی {symbol}: {e}")
+                
+        # 💡 در شبیه‌سازی فقط Log می‌گیریم
+        elif not LIVE_TRADING:
+            print(f"[{get_tehran_time()}] 🔄 SL متحرک (شبیه‌سازی) {symbol} به {round(new_sl, precision)} به‌روز شد.")
+            save_state()
+
+# --------------------------------------------------------------------------
+# توابع استراتژی و فیلترها
+# --------------------------------------------------------------------------
+
+def check_long_term_trend(symbol, ohlcv_4h):
+    """
+    محاسبه روند بلندمدت (4 ساعته) با EMA.
+    خروجی: 'LONG', 'SHORT', 'NEUTRAL'
+    """
+    if len(ohlcv_4h) < LONG_TERM_EMA_PERIOD:
+        return 'NEUTRAL'
+    
+    close_prices = pd.Series([x[4] for x in ohlcv_4h])
+    ema = talib.EMA(close_prices.values, timeperiod=LONG_TERM_EMA_PERIOD)
+    
+    last_close = close_prices.iloc[-1]
+    last_ema = ema[-1]
+    
+    if last_close > last_ema:
+        return 'LONG'
+    elif last_close < last_ema:
+        return 'SHORT'
+    return 'NEUTRAL'
+
+def check_adx_filter(ohlcv_15m):
+    """فیلتر قدرت روند با ADX."""
+    if len(ohlcv_15m) < ADX_PERIOD:
+        return False, "داده کافی نیست"
+    
+    high = pd.Series([x[2] for x in ohlcv_15m]).values
+    low = pd.Series([x[3] for x in ohlcv_15m]).values
+    close = pd.Series([x[4] for x in ohlcv_15m]).values
+    
+    adx = talib.ADX(high, low, close, timeperiod=ADX_PERIOD)
+    current_adx = adx[-1]
+    
+    if current_adx >= ADX_MIN_LEVEL:
+        return True, f"ADX قوی ({round(current_adx, 2)})"
+    return False, f"ADX ضعیف ({round(current_adx, 2)})"
+
+def check_trend_breakout_signal(ohlcv):
+    """
+    استراتژی شکست روند (EMA 50).
+    خروجی: ('LONG', entry, sl, tp) یا ('SHORT', entry, sl, tp) یا None
+    """
+    if len(ohlcv) < EMA_TREND_PERIOD + ATR_PERIOD: return None
+
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # اندیکاتورها
+    ema = talib.EMA(df['close'].values, timeperiod=EMA_TREND_PERIOD)
+    atr = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=ATR_PERIOD)
+    current_atr = atr[-1]
+    
+    # کندل‌های اخیر
+    c0 = df.iloc[-1] # کندل فعلی
+    c1 = df.iloc[-2] # کندل قبل
+    
+    # سیگنال Long: شکست صعودی EMA
+    long_signal = (c1['close'] < ema[-2] and c0['close'] > ema[-1])
+    
+    # سیگنال Short: شکست نزولی EMA
+    short_signal = (c1['close'] > ema[-2] and c0['close'] < ema[-1])
+    
+    if long_signal:
+        entry = c0['close']
+        sl = c0['low'] - (0.5 * current_atr) # SL زیر low کندل سیگنال
+        risk_distance = entry - sl
+        tp = entry + (risk_distance * 1.5) # R:R 1.5
+        return 'LONG', entry, sl, tp, current_atr, "TrendBreakout"
+
+    if short_signal:
+        entry = c0['close']
+        sl = c0['high'] + (0.5 * current_atr) # SL بالای high کندل سیگنال
+        risk_distance = sl - entry
+        tp = entry - (risk_distance * 1.5) # R:R 1.5
+        return 'SHORT', entry, sl, tp, current_atr, "TrendBreakout"
+    
+    return None
+
+def check_spt_signal(ohlcv):
+    """
+    استراتژی Spike Price Trigger (SPT) یا Liquidation Flush.
+    خروجی: ('LONG', entry, sl, tp) یا ('SHORT', entry, sl, tp) یا None
+    """
+    if len(ohlcv) < ATR_PERIOD + 2: return None
+    
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # اندیکاتورها
+    atr = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=ATR_PERIOD)
+    avg_volume = df['volume'].rolling(window=VOLUME_AVG_PERIOD).mean()
+    current_atr = atr[-1]
+    
+    # کندل‌های اخیر
+    c0 = df.iloc[-1] # کندل فعلی (که باید بازگشت را تأیید کند)
+    c1 = df.iloc[-2] # کندل فلاش (Spike/Flush)
+    
+    avg_vol = avg_volume.iloc[-2]
+    
+    # فیلتر حجم: Volume کندل فلاش باید از میانگین بیشتر باشد
+    volume_ok = c1['volume'] > (avg_vol * MIN_VOLUME_MULTIPLIER)
+    if not volume_ok: return None
+
+    # فیلتر بدنه/شدو Spike (C1)
+    c1_range = c1['high'] - c1['low']
+    c1_body = abs(c1['close'] - c1['open'])
+    
+    # فیلتر برگشت (C0)
+    c0_body = abs(c0['close'] - c0['open'])
+    
+    # سیگنال Long: فلاش نزولی + برگشت قوی صعودی
+    if c1['close'] < c1['open']: # کندل نزولی
+        lower_shadow = c1['open'] - c1['low']
+        
+        # 1. کندل C1 باید یک فلاش نزولی باشد (شدو پایین حداقل 3 برابر بدنه)
+        is_long_flush = lower_shadow > (c1_body * SPIKE_BODY_MULTIPLIER)
+        
+        # 2. کندل C0 باید یک برگشت قوی صعودی باشد (حداقل 50% از رنج C1)
+        is_long_confirmation = (c0_body >= c1_range * SMART_ENTRY_RETRA_RATIO) and (c0['close'] > c0['open'])
+        
+        if is_long_flush and is_long_confirmation:
+            entry = c0['close']
+            sl = c1['low'] - (0.5 * current_atr) # SL زیر پایین‌ترین نقطه فلاش
+            risk_distance = entry - sl
+            tp = entry + (risk_distance * SPT_RR_RATIO)
+            return 'LONG', entry, sl, tp, current_atr, "SPT"
+
+    # سیگنال Short: فلاش صعودی + برگشت قوی نزولی
+    if c1['close'] > c1['open']: # کندل صعودی
+        upper_shadow = c1['high'] - c1['close']
+        
+        # 1. کندل C1 باید یک فلاش صعودی باشد (شدو بالا حداقل 3 برابر بدنه)
+        is_short_flush = upper_shadow > (c1_body * SPIKE_BODY_MULTIPLIER)
+        
+        # 2. کندل C0 باید یک برگشت قوی نزولی باشد (حداقل 50% از رنج C1)
+        is_short_confirmation = (c0_body >= c1_range * SMART_ENTRY_RETRA_RATIO) and (c0['close'] < c0['open'])
+        
+        if is_short_flush and is_short_confirmation:
+            entry = c0['close']
+            sl = c1['high'] + (0.5 * current_atr) # SL بالای بالاترین نقطه فلاش
+            risk_distance = sl - entry
+            tp = entry - (risk_distance * SPT_RR_RATIO)
+            return 'SHORT', entry, sl, tp, current_atr, "SPT"
+
+    return None
+
+def process_symbol(symbol):
+    """منطق اصلی پردازش هر نماد."""
+    global last_candle_timestamp, current_candle, LONG_TERM_TRENDS
+
+    # 1. چک کردن محدودیت‌ها
+    if symbol in Ledger:
+        # در حالت Live، چک کردن وضعیت درونی فقط برای Trailng Stop و SL/TP شبیه‌سازی است
+        if not LIVE_TRADING:
+           check_trade_status(symbol, current_candle['high'], current_candle['low'])
+        
+        manage_trailing_stop(symbol, current_candle['close'], current_candle['atr'], Ledger[symbol]['side'])
+        return
+
+    if len(Ledger) >= MAX_CONCURRENT_TRADES:
+        # print(f"[{get_tehran_time()}] ⚠️ {symbol}: سقف معاملات باز ({MAX_CONCURRENT_TRADES}) رسیده است.")
+        return
+
+    # 2. دریافت داده‌های OHLCV
+    try:
+        # دریافت داده‌های تایم فریم اصلی (15m)
+        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=OHLCV_LIMIT)
+        if not ohlcv or len(ohlcv) < 100:
+            print(f"[{get_tehran_time()}] ⚠️ داده کافی برای {symbol} یافت نشد.")
+            return
+
+        # به‌روزرسانی زمان آخرین کندل
+        current_candle_timestamp = ohlcv[-1][0]
+        if symbol not in last_candle_timestamp or last_candle_timestamp[symbol] != current_candle_timestamp:
+            last_candle_timestamp[symbol] = current_candle_timestamp
+            is_new_candle = True
+        else:
+            is_new_candle = False
+
+        if not is_new_candle:
+            # ربات فقط روی کندل بسته شده تصمیم می‌گیرد
+            return
+        
+        # دریافت داده‌های تایم فریم بلندمدت (4h)
+        ohlcv_4h = exchange.fetch_ohlcv(symbol, TREND_TIMEFRAME, limit=LONG_TERM_EMA_PERIOD + 2)
+        if not ohlcv_4h or len(ohlcv_4h) < LONG_TERM_EMA_PERIOD:
+            long_term_trend = 'NEUTRAL'
+        else:
+            long_term_trend = check_long_term_trend(symbol, ohlcv_4h)
+        LONG_TERM_TRENDS[symbol] = long_term_trend
+
+        # اندیکاتورهای مورد نیاز برای مدیریت ریسک
+        df_15m = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        atr = talib.ATR(df_15m['high'].values, df_15m['low'].values, df_15m['close'].values, timeperiod=ATR_PERIOD)
+        adx = talib.ADX(df_15m['high'].values, df_15m['low'].values, df_15m['close'].values, timeperiod=ADX_PERIOD)
+
+        current_candle = {
+            'close': df_15m['close'].iloc[-1],
+            'high': df_15m['high'].iloc[-1],
+            'low': df_15m['low'].iloc[-1],
+            'atr': atr[-1],
+            'adx': adx[-1]
+        }
+        
+        # 3. بررسی فیلتر ADX
+        is_adx_ok, adx_reason = check_adx_filter(ohlcv)
+        if not is_adx_ok:
+            # print(f"[{get_tehran_time()}] 🛑 {symbol}: فیلتر ADX فعال شد. ({adx_reason})")
+            return
+            
+        # 4. بررسی سیگنال‌ها
+        signal = None
+        
+        # اولویت با SPT (فلاش‌های نقدینگی)
+        spt_result = check_spt_signal(ohlcv)
+        if spt_result:
+             signal = spt_result
+             
+        # سپس Trend Breakout
+        if not signal:
+             signal = check_trend_breakout_signal(ohlcv)
+
+        if not signal:
+            return
+
+        side, entry, sl, tp, current_atr, strategy_type = signal
+
+        # 5. چک کردن فیلتر روند بلندمدت
+        if long_term_trend != 'NEUTRAL' and long_term_trend != side:
+            print(f"[{get_tehran_time()}] 🛑 {symbol} سیگنال {side} با روند بلندمدت {long_term_trend} مغایرت دارد.")
+            return
+
+        # 6. فیلتر همبستگی
+        is_corr_ok, corr_reason = check_correlation_filter(symbol, side)
+        if not is_corr_ok:
+            print(f"[{get_tehran_time()}] 🛑 {symbol}: فیلتر همبستگی فعال شد. ({corr_reason})")
+            return
+            
+        # 7. محاسبه سایز پوزیشن
+        size = calculate_position_size(symbol, entry, sl, RISK_AMOUNT)
+        if size == 0.0:
+            print(f"[{get_tehran_time()}] 🛑 {symbol}: سایز پوزیشن صفر است (ریسک زیاد یا مارجین ناکافی).")
+            return
+            
+        # 8. اجرای معامله
+        if LIVE_TRADING:
+            # Live Trading: ثبت سفارش Market و سپس SL/TP بومی
+            success, final_entry, sl_id, tp_id = place_order_and_set_native_stop(symbol, side, size, sl, tp)
+            if success:
+                 update_ledger_simulated(symbol, side, size, final_entry, sl, tp, 'OPEN', strategy_type, sl_order_id=sl_id, tp_order_id=tp_id)
+            else:
+                 print(f"[{get_tehran_time()}] ❌ {symbol}: خطا در ثبت سفارش Live Trading.")
+
+        else:
+            # Simulated Trading
+            update_ledger_simulated(symbol, side, size, entry, sl, tp, 'OPEN', strategy_type)
+
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"[{get_tehran_time()}] ❌ خطای پردازش {symbol}: {e}")
+        # send_telegram_message(f"❌ خطای پردازش {symbol}:\n{error_details[:500]}...")
+
+
+def main_loop():
+    """حلقه اصلی اجرای ربات."""
+    global LAST_REPORT_DATE, EXCHANGE_CONNECTED
+    
+    # 1. به‌روزرسانی پارامترها و همگام‌سازی
+    load_state()
+
+    # 2. بررسی ریست روزانه (گزارش و بازنشانی آمار)
+    current_date = get_tehran_time().split(' ')[0]
+    if LAST_REPORT_DATE != current_date:
+        if LAST_REPORT_DATE is not None:
+             report = get_strategy_performance_report()
+             send_telegram_message(report)
+        reset_daily_stats()
+        
+    # 3. بررسی سقف زیان روزانه
+    check_max_daily_loss()
+    
+    # 4. بارگذاری پارامترهای بازار
+    if not MARKET_DATA:
+        if not load_market_params():
+             return # اگر نتوانست متصل شود، متوقف می‌شود.
+             
+    # 5. همگام‌سازی با صرافی (فقط Live Trading)
+    sync_with_exchange()
+
+
+    print(f"\n--- شروع چرخه جدید در {get_tehran_time()} (باز: {len(Ledger)}/{MAX_CONCURRENT_TRADES}) ---")
+    
+    # 6. پردازش نمادها
+    for symbol in SYMBOLS:
+        process_symbol(symbol)
+        time.sleep(1) # تاخیر برای جلوگیری از Rate Limit
+
+    print(f"--- چرخه کامل شد. ---")
+
+
+if __name__ == '__main__':
+    print(f"==================================================")
+    print(f"🚀 ربات تریدینگ کوینکس - شروع به کار")
+    print(f"📅 زمان تهران: {get_tehran_time()}")
+    print(f"⚙️ وضعیت: {'✅ Live' if LIVE_TRADING else '💡 Simulated (Test)'}")
+    print(f"==================================================")
+    
+    # حلقه اصلی
+    while True:
+        try:
+            main_loop()
+        except Exception as e:
+            error_details = traceback.format_exc()
+            print(f"❌ خطای ناشناخته در حلقه اصلی: {e}")
+            send_telegram_message(f"**❌ خطای بحرانی در حلقه اصلی:**\n{error_details[:500]}...")
+            time.sleep(30) # تاخیر برای جلوگیری از حلقه خطا
+        
+        # تاخیر بین هر چرخه (بسته به تایم فریم)
+        time.sleep(30) # 30 ثانیه
